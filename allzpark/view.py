@@ -35,7 +35,7 @@ class Window(QtWidgets.QMainWindow):
             ("loading", QtWidgets.QWidget()),
             ("errored", QtWidgets.QWidget()),
             ("noapps", QtWidgets.QWidget()),
-            ("noproject", QtWidgets.QWidget()),
+            ("noprofiles", QtWidgets.QWidget()),
         ))
 
         panels = {
@@ -50,21 +50,22 @@ class Window(QtWidgets.QMainWindow):
             "loadingMessage": QtWidgets.QLabel("Loading"),
             "errorMessage": QtWidgets.QLabel("Uh oh..<br>"
                                              "See Console for details"),
-            "noappsMessage": QtWidgets.QLabel("No applications found"),
-            "noprojectMessage": QtWidgets.QLabel("No project found"),
+            "noappsMessage": QtWidgets.QTextBrowser(),
+            "noprofileMessage": QtWidgets.QLabel("No profiles was found"),
             "pkgnotfoundMessage": QtWidgets.QLabel(
                 "One or more packages could not be found"
             ),
 
             # Header
-            "logo": QtWidgets.QLabel(),  # unused
-            "appVersion": QtWidgets.QLabel(version),  # unused
+            "logo": QtWidgets.QToolButton(),
+            "appVersion": QtWidgets.QLabel(version),
 
-            "projectBtn": QtWidgets.QToolButton(),
-            "projectName": LineEditWithCompleter(),
-            "projectVersion": LineEditWithCompleter(),
+            "profileBtn": dock.PushButtonWithMenu(),
+            "profileName": dock.LineEditWithCompleter(),
+            "profileVersion": dock.LineEditWithCompleter(),
 
             "apps": dock.SlimTableView(),
+            "fullCommand": FullCommand(ctrl),
 
             # Error page
             "continue": QtWidgets.QPushButton("Continue"),
@@ -79,7 +80,7 @@ class Window(QtWidgets.QMainWindow):
         docks = odict((
             ("app", dock.App(ctrl)),
             ("packages", dock.Packages(ctrl)),
-            ("context", dock.Context()),
+            ("context", dock.Context(ctrl)),
             ("environment", dock.Environment(ctrl)),
             ("console", dock.Console()),
             ("commands", dock.Commands()),
@@ -134,20 +135,18 @@ class Window(QtWidgets.QMainWindow):
         layout = QtWidgets.QVBoxLayout(pages["noapps"])
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(QtWidgets.QWidget(), 1)
-        layout.addWidget(widgets["noappsMessage"], 0, QtCore.Qt.AlignHCenter)
-        layout.addWidget(QtWidgets.QWidget(), 1)
+        layout.addWidget(widgets["noappsMessage"], 0)
 
-        layout = QtWidgets.QVBoxLayout(pages["noproject"])
+        layout = QtWidgets.QVBoxLayout(pages["noprofiles"])
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(QtWidgets.QWidget(), 1)
-        layout.addWidget(widgets["noprojectMessage"], 0, QtCore.Qt.AlignHCenter)
+        layout.addWidget(widgets["noprofileMessage"], 0, QtCore.Qt.AlignHCenter)
         layout.addWidget(QtWidgets.QWidget(), 1)
 
         #  _______________________________________________________
         # |          |         |         |               |        |
-        # |   logo   | project |---------|               |--------|
+        # |   logo   | profile |---------|               |--------|
         # |__________|_________|_________|_______________|________|
         #
 
@@ -166,9 +165,9 @@ class Window(QtWidgets.QMainWindow):
             if kwargs.get("stretch"):
                 layout.setColumnStretch(addColumn.row, kwargs["stretch"])
 
-        addColumn([widgets["projectBtn"]], 2, 1)
-        addColumn([widgets["projectName"],
-                   widgets["projectVersion"]])
+        addColumn([widgets["profileBtn"]], 2, 1)
+        addColumn([widgets["profileName"],
+                   widgets["profileVersion"]])
 
         addColumn([QtWidgets.QWidget()], stretch=1)
         addColumn([widgets["dockToggles"]], 2, 1)
@@ -221,30 +220,38 @@ class Window(QtWidgets.QMainWindow):
             layout.addWidget(toggle)
 
         layout = QtWidgets.QVBoxLayout(panels["body"])
+        layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widgets["apps"])
+        layout.addWidget(widgets["fullCommand"])
 
         status_bar = self.statusBar()
         status_bar.addPermanentWidget(widgets["stateIndicator"])
 
         # Setup
-        widgets["logo"].setPixmap(res.pixmap("Logo_64"))
-        widgets["logo"].setScaledContents(True)
-        widgets["projectBtn"].setToolTip("Click to change project")
-        widgets["projectBtn"].clicked.connect(self.on_projectbtn_pressed)
+        css = "QWidget { border-image: url(%s); }"
+        widgets["logo"].setStyleSheet(css % res.find("Logo_64"))
+
+        widgets["noappsMessage"].setReadOnly(True)
+        widgets["noappsMessage"].setOpenExternalLinks(True)
+
+        widgets["profileBtn"].setIconSize(QtCore.QSize(px(32), px(32)))
+        widgets["profileBtn"].setToolTip("Click to change profile\n"
+                                         "Right-click for options")
+        widgets["profileBtn"].setIcon(res.icon("Default_Profile"))
 
         css = "QWidget { border-image: url(%s); }"
-        widgets["projectBtn"].setStyleSheet(css % res.find("Default_Project"))
-        widgets["projectBtn"].setIconSize(QtCore.QSize(px(32), px(32)))
 
-        widgets["projectBtn"].setCursor(QtCore.Qt.PointingHandCursor)
-        widgets["projectName"].setCursor(QtCore.Qt.PointingHandCursor)
-        widgets["projectVersion"].setCursor(QtCore.Qt.PointingHandCursor)
+        widgets["logo"].setCursor(QtCore.Qt.PointingHandCursor)
+        widgets["logo"].setToolTip(allzparkconfig.help_url)
+        widgets["profileBtn"].setCursor(QtCore.Qt.PointingHandCursor)
+        widgets["profileName"].setCursor(QtCore.Qt.PointingHandCursor)
+        widgets["profileVersion"].setCursor(QtCore.Qt.PointingHandCursor)
 
-        widgets["projectName"].setToolTip("Click to change project")
-        widgets["projectName"].setModel(ctrl.models["projectNames"])
-        widgets["projectVersion"].setToolTip("Click to change project version")
-        widgets["projectVersion"].setModel(ctrl.models["projectVersions"])
+        widgets["profileName"].setToolTip("Click to change profile")
+        widgets["profileName"].setModel(ctrl.models["profileNames"])
+        widgets["profileVersion"].setToolTip("Click to change profile version")
+        widgets["profileVersion"].setModel(ctrl.models["profileVersions"])
 
         docks["packages"].set_model(ctrl.models["packages"])
         docks["context"].set_model(ctrl.models["context"])
@@ -256,31 +263,35 @@ class Window(QtWidgets.QMainWindow):
 
         widgets["errorMessage"].setAlignment(QtCore.Qt.AlignHCenter)
 
-        # Signals
-        widgets["projectName"].changed.connect(self.on_projectname_changed)
-        widgets["projectVersion"].changed.connect(
-            self.on_projectversion_changed)
+        widgets["logo"].clicked.connect(self.on_logo_clicked)
+        widgets["profileBtn"].clicked.connect(self.on_profilebtn_pressed)
+        widgets["profileBtn"].customContextMenuRequested.connect(
+            self.on_profilebtn_contextmenu)
+        widgets["profileName"].changed.connect(self.on_profilename_changed)
+        widgets["profileVersion"].changed.connect(
+            self.on_profileversion_changed)
 
         widgets["reset"].clicked.connect(self.on_reset_clicked)
         widgets["continue"].clicked.connect(self.on_continue_clicked)
         widgets["apps"].activated.connect(self.on_app_clicked)
-
         widgets["apps"].customContextMenuRequested.connect(
             self.on_app_right_click)
 
         selection_model = widgets["apps"].selectionModel()
-        selection_model.selectionChanged.connect(self.on_app_changed)
+        selection_model.selectionChanged.connect(self.on_app_selection_changed)
 
         ctrl.models["apps"].modelReset.connect(self.on_apps_reset)
-        ctrl.models["projectNames"].modelReset.connect(
-            self.on_projectname_reset)
-        ctrl.models["projectVersions"].modelReset.connect(
-            self.on_projectversion_reset)
+        ctrl.models["profileNames"].modelReset.connect(
+            self.on_profilename_reset)
+        ctrl.models["profileVersions"].modelReset.connect(
+            self.on_profileversion_reset)
         ctrl.resetted.connect(self.on_reset)
         ctrl.state_changed.connect(self.on_state_changed)
         ctrl.logged.connect(self.on_logged)
-        ctrl.project_changed.connect(self.on_project_changed)
+        ctrl.profile_changed.connect(self.on_profile_changed)
         ctrl.repository_changed.connect(self.on_repository_changed)
+        ctrl.command_changed.connect(self.on_command_changed)
+        ctrl.application_changed.connect(self.on_app_changed)
 
         self._pages = pages
         self._widgets = widgets
@@ -291,6 +302,7 @@ class Window(QtWidgets.QMainWindow):
         self.setup_docks()
         self.on_state_changed("booting")
         self.update_advanced_controls()
+        self.setFocus()
 
         # Enable mouse tracking for tooltips
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -318,7 +330,8 @@ class Window(QtWidgets.QMainWindow):
 
     def update_advanced_controls(self):
         shown = bool(self._ctrl.state.retrieve("showAdvancedControls"))
-        self._widgets["projectVersion"].setVisible(shown)
+        self._widgets["profileVersion"].setVisible(shown)
+        self._widgets["fullCommand"].setVisible(shown)
 
         # Update dock toggles
         toggles = self._widgets["dockToggles"].layout()
@@ -359,6 +372,9 @@ class Window(QtWidgets.QMainWindow):
     def on_reset(self):
         pass
 
+    def on_command_changed(self, command):
+        self._widgets["fullCommand"].setText(command)
+
     def on_command_copied(self, cmd):
         self.tell("Copied command '%s'" % cmd)
 
@@ -379,7 +395,7 @@ class Window(QtWidgets.QMainWindow):
         model = index.model()
         tools = model.data(index, "tools")
 
-        menu = QtWidgets.QMenu(self)
+        menu = dock.MenuWithTooltip(self)
 
         separator = QtWidgets.QWidgetAction(menu)
         separator.setDefaultWidget(QtWidgets.QLabel("Quick Launch"))
@@ -435,6 +451,10 @@ class Window(QtWidgets.QMainWindow):
                    "patchWithFilter"):
             self._ctrl.reset()
 
+        if key == "exclusionFilter":
+            allzparkconfig.exclude_filter = value
+            self._ctrl.reset()
+
     def on_dock_toggled(self, dock, visible):
         """Make toggled dock the active dock"""
 
@@ -484,41 +504,65 @@ class Window(QtWidgets.QMainWindow):
 
         bar.setCurrentIndex(index)
 
-    def on_projectname_clicked(self):
+    def on_profilename_clicked(self):
         pass
 
-    def on_projectname_changed(self, project):
-        self._ctrl.select_project(project)
-        self._ctrl.state.store("startupProject", project)
+    def on_profilename_changed(self, profile):
+        """User changed the profile"""
+        self._ctrl.select_profile(profile)
+        self._ctrl.state.store("startupProfile", profile)
         self.setFocus()
 
-    def on_projectversion_changed(self, version):
-        project = self._ctrl.current_project
-        self._ctrl.select_project(project, version)
+    def on_profileversion_changed(self, version):
+        """User changed the profile version"""
+        profile = self._ctrl.current_profile
+        self._ctrl.select_profile(profile, version)
         self.setFocus()
 
-    def on_projectbtn_pressed(self):
-        widget = self._widgets["projectName"]
+    def on_profilebtn_pressed(self):
+        widget = self._widgets["profileName"]
         widget.setFocus()
         widget.selectAll()
 
         completer = widget.completer()
         completer.complete()
 
-    def on_project_changed(self, project, version, refreshed=False):
+    def on_profilebtn_contextmenu(self):
+        name = self._widgets["profileName"].text()
+
+        menu = dock.MenuWithTooltip(self)
+        separator = QtWidgets.QWidgetAction(menu)
+        separator.setDefaultWidget(QtWidgets.QLabel(name))
+        menu.addAction(separator)
+
+        def on_reset():
+            self.reset()
+
+        reset = QtWidgets.QAction("Reset", menu)
+        reset.triggered.connect(on_reset)
+        reset.setToolTip("Re-scan repository for new Rez packages")
+        menu.addAction(reset)
+
+        menu.addSeparator()
+
+        menu.move(QtGui.QCursor.pos())
+        menu.show()
+
+    def on_logo_clicked(self):
+        url = allzparkconfig.help_url
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def on_profile_changed(self, profile, version, refreshed=False):
+        """Profile changed in the controller"""
+
         # Happens when editing requirements
         action = "Refreshing" if refreshed else "Changing"
+        icon = res.find("Default_Profile")
+        label = profile
 
-        self.tell("%s %s-%s" % (action, project, version))
-        self.setWindowTitle("%s | %s" % (project, self.title))
-
-        package = self._ctrl.state["rezProjects"][project][version]
+        package = self._ctrl.state["rezProfiles"][profile][version]
         data = allzparkconfig.metadata_from_package(package)
-
-        self._widgets["projectName"].setText(data["label"])
-        self._widgets["projectVersion"].setText(version)
-
-        icon = res.find("Default_Project")
+        label = data["label"]
 
         # Facilitate overriding of icon via package metadata
         if data.get("icon"):
@@ -542,17 +586,34 @@ class Window(QtWidgets.QMainWindow):
                 self.tell("Unexpected error coming from icon of %s"
                           % package.uri)
 
-        css = "QWidget { border-image: url(%s); }"
-        button = self._widgets["projectBtn"]
-        button.setStyleSheet(css % icon)
+        self.tell("%s %s-%s" % (action, profile, version))
+        self.setWindowTitle("%s  |  %s" % (label, self.title))
+
+        self._widgets["profileName"].setText(label)
+        self._widgets["profileVersion"].setText(version)
+
+        button = self._widgets["profileBtn"]
+        button.setIcon(res.icon(icon))
 
         # Determine aspect ratio
         height = px(32)
-        pixmap = res.pixmap(icon).scaledToHeight(height)
+        pixmap = res.pixmap(icon)
+
+        if pixmap.isNull():
+            pixmap = res.pixmap("Default_Profile")
+
+        pixmap = pixmap.scaledToHeight(height)
         width = pixmap.width()
 
         button.setIconSize(QtCore.QSize(width, height))
         button.setAutoFillBackground(True)
+
+    def setStyleSheet(self, style):
+        style = style % {
+            "root": os.path.dirname(__file__).replace("\\", "/"),
+            "res": res.dirname.replace("\\", "/"),
+        }
+        super(Window, self).setStyleSheet(style)
 
     def on_repository_changed(self):
         self.reset()
@@ -561,49 +622,50 @@ class Window(QtWidgets.QMainWindow):
         self._docks["console"].append(self._ctrl.current_error)
         self._docks["console"].raise_()
 
-    def tell(self, message):
-        self._docks["console"].append(message, logging.INFO)
+    def tell(self, message, level=logging.INFO):
+        self._docks["console"].append(message, level)
         self.statusBar().showMessage(message, 2000)
 
     def on_logged(self, message, level):
         self._docks["console"].append(message, level)
 
     def on_state_changed(self, state):
-        self.tell("State: %s" % state)
+        self.tell("State: %s" % state, logging.DEBUG)
 
         page = self._pages.get(str(state), self._pages["home"])
         page_name = page.objectName()
         self._panels["pages"].setCurrentWidget(page)
+        self._widgets["profileName"].setEnabled(True)
+        self._widgets["profileVersion"].setEnabled(True)
+        self._widgets["profileBtn"].setEnabled(True)
 
         launch_btn = self._docks["app"]._widgets["launchBtn"]
         launch_btn.setText("Launch")
+        launch_btn.setEnabled(True)
 
         for widget in self._docks.values():
             widget.setEnabled(True)
 
         if page_name == "home":
             self._widgets["apps"].setEnabled(state == "ready")
-            self._widgets["projectBtn"].setEnabled(state == "ready")
-            self._widgets["projectVersion"].setEnabled(state == "ready")
+            self._widgets["profileBtn"].setEnabled(state == "ready")
+            self._widgets["profileVersion"].setEnabled(state == "ready")
 
         elif page_name == "noapps":
-            self._widgets["projectBtn"].setEnabled(True)
-            self._widgets["noappsMessage"].setText(
-                "No apps was found for '%s'\n"
-                "Check your REZ_PACKAGES_PATH" % self._ctrl.current_project
-            )
+            message = self._ctrl.state["error"]
+            self._widgets["profileBtn"].setEnabled(True)
+            self._widgets["noappsMessage"].setText(message)
 
-        elif page_name == "noproject":
-            self._widgets["projectBtn"].setEnabled(True)
-            self._widgets["noprojectMessage"].setText(
-                "No Rez package was found for project '%s'\n"
-                "Check your REZ_PACKAGES_PATH" % self._ctrl.current_project
-            )
+        elif page_name == "noprofiles":
+            self._widgets["profileBtn"].setEnabled(True)
 
         if state == "launching":
             self._docks["app"].setEnabled(False)
 
         if state == "loading":
+            self._widgets["profileBtn"].setEnabled(False)
+            self._widgets["profileName"].setEnabled(False)
+            self._widgets["profileVersion"].setEnabled(False)
             for widget in self._docks.values():
                 widget.setEnabled(False)
 
@@ -630,11 +692,11 @@ class Window(QtWidgets.QMainWindow):
     def on_launch_clicked(self):
         self._ctrl.launch()
 
-    def on_projectname_reset(self):
-        print("Projects changed")
+    def on_profilename_reset(self):
+        pass
 
-    def on_projectversion_reset(self):
-        print("Versions changed")
+    def on_profileversion_reset(self):
+        pass
 
     def on_apps_reset(self):
         app = self._ctrl.state.retrieve("startupApplication")
@@ -645,7 +707,7 @@ class Window(QtWidgets.QMainWindow):
         if app:
             for row_ in range(model.rowCount()):
                 index = model.index(row_, 0, QtCore.QModelIndex())
-                name = model.data(index, QtCore.Qt.DisplayRole)
+                name = model.data(index, "name")
 
                 if app == name:
                     row = row_
@@ -661,7 +723,7 @@ class Window(QtWidgets.QMainWindow):
         app.show()
         self.on_dock_toggled(app, visible=True)
 
-    def on_app_changed(self, selected, deselected):
+    def on_app_selection_changed(self, selected, deselected):
         """The current app was changed
 
         Arguments:
@@ -679,6 +741,10 @@ class Window(QtWidgets.QMainWindow):
         model = index.model()
         app_request = model.data(index, "name")
         self._ctrl.select_application(app_request)
+
+    def on_app_changed(self):
+        selection_model = self._widgets["apps"].selectionModel()
+        index = selection_model.selectedIndexes()[0]
         self._docks["app"].refresh(index)
 
     def showEvent(self, event):
@@ -687,74 +753,69 @@ class Window(QtWidgets.QMainWindow):
         self._ctrl.state.store("default/windowState", self.saveState())
 
         if self._ctrl.state.retrieve("geometry"):
-            self.tell("Restoring layout..")
+            self.tell("Restoring layout..", logging.DEBUG)
             self.restoreGeometry(self._ctrl.state.retrieve("geometry"))
             self.restoreState(self._ctrl.state.retrieve("windowState"))
 
     def closeEvent(self, event):
-        self.tell("Storing state..")
         self._ctrl.state.store("geometry", self.saveGeometry())
         self._ctrl.state.store("windowState", self.saveState())
+        return super(Window, self).closeEvent(event)
 
-        super(Window, self).closeEvent(event)
 
+class FullCommand(QtWidgets.QWidget):
+    def __init__(self, ctrl, parent=None):
+        super(FullCommand, self).__init__(parent)
 
-class LineEditWithCompleter(QtWidgets.QLineEdit):
-    changed = QtCore.Signal(str)
+        widgets = {
+            "options": QtWidgets.QComboBox(),
+            "text": QtWidgets.QLineEdit(),
+        }
 
-    def __init__(self, parent=None):
-        super(LineEditWithCompleter, self).__init__(parent)
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setSpacing(0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widgets["options"])
+        layout.addWidget(widgets["text"])
 
-        proxy = QtCore.QSortFilterProxyModel(self)
-        proxy.setFilterCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        up_icon = res.icon("Action_GoUp_3_Large_32.png")
+        down_icon = res.icon("Action_GoDown_3_32.png")
 
-        completer = QtWidgets.QCompleter(proxy, self)
-        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
-        completer.setCompletionMode(completer.UnfilteredPopupCompletion)
-        completer.setMaxVisibleItems(15)
+        widgets["text"].setReadOnly(True)
+        widgets["options"].addItem(up_icon, "Used Request")
+        widgets["options"].addItem(down_icon, "Used Resolve")
 
-        self.setCompleter(completer)
-        self.editingFinished.connect(self.onEditingFinished)
+        widgets["options"].currentIndexChanged.connect(self.on_option_changed)
 
-        self._completer = completer
-        self._focused = False
-        self._proxy = proxy
-        self._current = None
+        self._widgets = widgets
+        self._ctrl = ctrl
 
-    def setModel(self, model):
-        self._proxy.setSourceModel(model)
-        self._completer.setModel(self._proxy)
+        index = (
+            0
+            if ctrl.state.retrieve("serialisationMode") == "used_request"
+            else 1
+        )
+
+        widgets["options"].setCurrentIndex(index)
 
     def setText(self, text):
+        self._widgets["text"].setText(text)
 
-        # Keep track of a "default" such that we can revert back to
-        # it following a bad completion.
-        self._current = text
-
-        return super(LineEditWithCompleter, self).setText(text)
-
-    def resetText(self):
-        self.setText(self._current)
-
-    def mousePressEvent(self, event):
-        super(LineEditWithCompleter, self).mousePressEvent(event)
-
-        # Automatically show dropdown on select
-        self._completer.complete()
-        self.selectAll()
-
-    def onEditingFinished(self):
-        # For whatever reason, the completion prefix isn't updated
-        # when coming from the user selecting an item from the
-        # completion listview. (Windows 10, PySide2, Python 3.7)
-        self._completer.setCompletionPrefix(self.text())
-
-        suggested = self._completer.currentCompletion()
-
-        if not suggested or suggested == self._current:
-            self.resetText()
-            self.parent().setFocus()
+    def on_option_changed(self, option):
+        if option == 0:
+            mode = "used_request"
+            self._widgets["options"].setToolTip(
+                "Used Request\n"
+                "Use the final request made to Rez,\n"
+                "excluding any indirect requirements."
+            )
         else:
-            self.setText(suggested)
-            self.changed.emit(suggested)
-            self._current = suggested
+            mode = "used_resolve"
+            self._widgets["options"].setToolTip(
+                "Used Resolve\n"
+                "Use the fully resolved list of packages,\n"
+                "including packages that may not be suitable\n"
+                "for another platform."
+            )
+
+        self._ctrl.update_command(mode)

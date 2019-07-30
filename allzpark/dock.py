@@ -6,7 +6,7 @@ import collections
 from itertools import chain
 
 from .vendor.Qt import QtWidgets, QtCore, QtGui, QtCompat
-from .vendor import qargparse
+from .vendor import qargparse, QtImageViewer
 
 from . import resources as res, model, delegates, util
 from . import allzparkconfig
@@ -29,7 +29,7 @@ class AbstractDockWidget(QtWidgets.QDockWidget):
 
     def __init__(self, title, parent=None):
         super(AbstractDockWidget, self).__init__(title, parent)
-        self.layout().setContentsMargins(15, 15, 15, 15)
+        self.layout().setContentsMargins(px(15), px(15), px(15), px(15))
 
         panels = {
             "help": QtWidgets.QLabel(),
@@ -37,7 +37,8 @@ class AbstractDockWidget(QtWidgets.QDockWidget):
         }
 
         for name, widget in panels.items():
-            widget.setObjectName(name)
+            widget.setAttribute(QtCore.Qt.WA_StyledBackground)
+            widget.setObjectName("dock%s" % name.title())
 
         central = QtWidgets.QWidget()
 
@@ -66,6 +67,8 @@ class AbstractDockWidget(QtWidgets.QDockWidget):
 
 
 class App(AbstractDockWidget):
+    """Aggregated information about the currently selected profile"""
+
     icon = "Alert_Info_32"
 
     def __init__(self, ctrl, parent=None):
@@ -92,12 +95,6 @@ class App(AbstractDockWidget):
             "args": qargparse.QArgumentParser([
                 qargparse.Choice("tool", help=(
                     "Which executable within the context of this application"
-                )),
-                qargparse.Boolean("detached", help=(
-                    "Spawn a dedicated console for this executable\n"
-                    "Typically only necessary for console applications. "
-                    "If you find that an executable doesn't provide a window, "
-                    "such as mayapy, then you probably want detached."
                 )),
             ]),
 
@@ -148,7 +145,6 @@ class App(AbstractDockWidget):
         widgets["environment"].setIcon(res.icon(Environment.icon))
         widgets["packages"].setIcon(res.icon(Packages.icon))
         widgets["terminal"].setIcon(res.icon(Console.icon))
-        widgets["tool"].setText("maya")
 
         widgets["args"].changed.connect(self.on_arg_changed)
 
@@ -169,15 +165,18 @@ class App(AbstractDockWidget):
         self._ctrl.launch()
 
     def on_arg_changed(self, arg):
-        if arg["name"] not in ("detached", "tool"):
+        if arg["name"] not in ("tool",):
             return
 
         ctrl = self._ctrl
         model = ctrl.models["apps"]
-        app_name = ctrl.state["appName"]
+        app_name = ctrl.state["appRequest"]
         app_index = model.findIndex(app_name)
         value = arg.read()
         model.setData(app_index, value, arg["name"])
+
+        if arg["name"] == "tool":
+            ctrl.select_tool(value)
 
     def refresh(self, index):
         name = index.data(QtCore.Qt.DisplayRole)
@@ -204,7 +203,7 @@ class App(AbstractDockWidget):
         arg.reset(tools[:], default_tool)
 
         self._proxy.setup(include=[
-            ("appName", name),
+            ("appRequest", name),
             ("running", "running"),
         ])
 
@@ -239,7 +238,10 @@ class Console(AbstractDockWidget):
 
     def append(self, line, level=logging.INFO):
         color = {
-            logging.WARNING: "<font color=\"red\">",
+            logging.DEBUG: "<font color=\"grey\">",
+            logging.WARNING: "<font color=\"darkorange\">",
+            logging.ERROR: "<font color=\"red\">",
+            logging.CRITICAL: "<font color=\"red\">",
         }.get(level, "<font color=\"#222\">")
 
         line = "%s%s</font><br>" % (color, line)
@@ -266,7 +268,11 @@ class Packages(AbstractDockWidget):
         self.setObjectName("Packages")
 
         panels = {
-            "central": QtWidgets.QWidget()
+            "central": QtWidgets.QTabWidget(),
+        }
+
+        pages = {
+            "packages": QtWidgets.QWidget(),
         }
 
         args = [
@@ -274,10 +280,6 @@ class Packages(AbstractDockWidget):
                 "useDevelopmentPackages",
                 default=ctrl._state.retrieve("useDevelopmentPackages"),
                 help="Include development packages in the resolve"),
-            qargparse.String(
-                "exclusionFilter",
-                default=allzparkconfig.exclude_filter,
-                help="Exclude versions that match this expression"),
             qargparse.String(
                 "patch",
                 default=ctrl._state.retrieve("patch"),
@@ -299,14 +301,16 @@ class Packages(AbstractDockWidget):
 
         self.setWidget(panels["central"])
 
-        layout = QtWidgets.QVBoxLayout(panels["central"])
+        panels["central"].addTab(pages["packages"], "Packages")
+
+        layout = QtWidgets.QVBoxLayout(pages["packages"])
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(widgets["args"])
         layout.addWidget(widgets["view"], 1)
         layout.addWidget(widgets["status"])
 
-        widgets["view"].setStretch(2)
+        widgets["view"].setStretch(4)
         widgets["view"].setItemDelegate(delegates.Package(ctrl, self))
         widgets["view"].setEditTriggers(widgets["view"].DoubleClicked)
         widgets["view"].verticalHeader().setDefaultSectionSize(px(20))
@@ -315,8 +319,11 @@ class Packages(AbstractDockWidget):
         widgets["status"].setSizeGripEnabled(False)
 
         widgets["args"].changed.connect(self.on_argument_changed)
+        ctrl.resetted.connect(self.on_resetted)
 
         self._ctrl = ctrl
+        self._panels = panels
+        self._pages = pages
         self._widgets = widgets
 
     def on_argument_changed(self, arg):
@@ -328,13 +335,15 @@ class Packages(AbstractDockWidget):
             self._ctrl._state.store("useLocalizedPackages", arg.read())
             self._ctrl.reset()
 
-        if arg["name"] == "exclusionFilter":
-            allzparkconfig.exclude_filter = arg.read()
-            self._ctrl.reset()
-
         if arg["name"] == "patch":
             self._ctrl._state.store("patch", arg.read())
             self._ctrl.reset()
+
+    def on_resetted(self):
+        patch = self._ctrl.state.retrieve("patch", "")
+        arg = self._widgets["args"].find("patch")
+        arg._write(patch)
+        arg._previous = patch
 
     def set_model(self, model_):
         proxy_model = model.ProxyModel(model_)
@@ -384,7 +393,6 @@ class Packages(AbstractDockWidget):
         disable.setChecked(model_.data(index, "disabled"))
 
         menu.addAction(edit)
-        menu.addAction(disable)
         menu.addSeparator()
         menu.addAction(default)
         menu.addAction(earliest)
@@ -393,7 +401,7 @@ class Packages(AbstractDockWidget):
         menu.addAction(openfile)
         menu.addAction(copyfile)
 
-        if self._ctrl.state.retrieve("localisationEnabled"):
+        if localz:
             enabled = True
             tooltip = None
 
@@ -428,62 +436,72 @@ class Packages(AbstractDockWidget):
             localize_all.setEnabled(False)
             localize_related.setEnabled(False)
 
-        menu.move(QtGui.QCursor.pos())
-
-        picked = menu.exec_()
-
-        if picked is None:
-            return  # Cancelled
-
-        if picked == edit:
+        def on_edit():
             self._widgets["view"].edit(index)
 
-        if picked == default:
-            model_.setData(index, None, "override")
-            model_.setData(index, False, "disabled")
+        def on_default():
+            package = model_.data(index, "package")
+            self._ctrl.patch(package.name)
             self.message.emit("Package set to default")
 
-        if picked == earliest:
+        def on_earliest():
             versions = model_.data(index, "versions")
-            model_.setData(index, versions[0], "override")
-            model_.setData(index, False, "disabled")
+            earliest = versions[0]
+            package = model_.data(index, "package")
+            self._ctrl.patch("%s==%s" % (package.name, earliest))
+
             self.message.emit("Package set to earliest")
 
-        if picked == latest:
+        def on_latest():
             versions = model_.data(index, "versions")
-            model_.setData(index, versions[-1], "override")
-            model_.setData(index, False, "disabled")
+            latest = versions[-1]
+            package = model_.data(index, "package")
+            self._ctrl.patch("%s==%s" % (package.name, latest))
+
             self.message.emit("Package set to latest version")
 
-        if picked == openfile:
+        def on_openfile():
             package = model_.data(index, "package")
             fname = os.path.join(package.root, "package.py")
             util.open_file_location(fname)
             self.message.emit("Opened %s" % fname)
 
-        if picked == copyfile:
+        def on_copyfile():
             package = model_.data(index, "package")
             fname = os.path.join(package.root, "package.py")
             clipboard = QtWidgets.QApplication.instance().clipboard()
             clipboard.setText(fname)
             self.message.emit("Copied %s" % fname)
 
-        if picked == disable:
+        def on_disable():
             model_.setData(index, None, "override")
             model_.setData(index, disable.isChecked(), "disabled")
             self.message.emit("Package disabled")
 
-        if picked in (localize, localize_all, localize_related):
+        def on_localize():
             name = model_.data(index, "name")
             self._ctrl.localize(name)
             model_.setData(index, "(localising..)", "state")
             model_.setData(index, True, model.LocalizingRole)
 
-        if picked == delocalize:
+        def on_delocalize():
             name = model_.data(index, "name")
             self._ctrl.delocalize(name)
             model_.setData(index, "(delocalising..)", "state")
             model_.setData(index, True, model.LocalizingRole)
+
+        edit.triggered.connect(on_edit)
+        disable.triggered.connect(on_disable)
+        default.triggered.connect(on_default)
+        earliest.triggered.connect(on_earliest)
+        latest.triggered.connect(on_latest)
+        openfile.triggered.connect(on_openfile)
+        copyfile.triggered.connect(on_copyfile)
+        localize.triggered.connect(on_localize)
+        delocalize.triggered.connect(on_delocalize)
+
+        menu.move(QtGui.QCursor.pos())
+        menu.show()
 
 
 class Context(AbstractDockWidget):
@@ -492,25 +510,70 @@ class Context(AbstractDockWidget):
     icon = "App_Generic_4_32"
     advanced = True
 
-    def __init__(self, parent=None):
+    def __init__(self, ctrl, parent=None):
         super(Context, self).__init__("Context", parent)
         self.setAttribute(QtCore.Qt.WA_StyledBackground)
         self.setObjectName("Context")
 
         panels = {
-            "central": QtWidgets.QWidget()
+            "central": QtWidgets.QTabWidget(),
+        }
+
+        pages = {
+            "context": QtWidgets.QWidget(),
+            "graph": QtWidgets.QWidget(),
         }
 
         widgets = {
-            "view": QtWidgets.QTreeView()
+            "view": QtWidgets.QTreeView(),
+            "graph": QtImageViewer.QtImageViewer(),
+            "generateGraph": QtWidgets.QPushButton("Update"),
+            "graphHotkeys": QtWidgets.QLabel(),
+            "overlay": QtWidgets.QWidget(),
         }
 
-        layout = QtWidgets.QVBoxLayout(panels["central"])
+        # Expose to CSS
+        for name, widget in chain(panels.items(),
+                                  pages.items(),
+                                  widgets.items()):
+            widget.setAttribute(QtCore.Qt.WA_StyledBackground)
+            widget.setObjectName(name)
+
+        layout = QtWidgets.QVBoxLayout(pages["context"])
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(widgets["view"])
 
+        layout = QtWidgets.QVBoxLayout(pages["graph"])
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(widgets["graph"], 1)
+
+        layout = QtWidgets.QVBoxLayout(widgets["overlay"])
+        layout.addWidget(widgets["graphHotkeys"])
+        layout.addWidget(widgets["generateGraph"])
+        layout.addWidget(QtWidgets.QWidget(), 1)
+
+        panels["central"].addTab(pages["context"], "Context")
+        panels["central"].addTab(pages["graph"], "Graph")
+
+        ctrl.application_changed.connect(self.on_application_changed)
+
+        widgets["overlay"].setParent(pages["graph"])
+        widgets["overlay"].show()
+
+        widgets["generateGraph"].clicked.connect(self.on_generate_clicked)
+        widgets["graphHotkeys"].setText("""\
+            <font color=\"steelblue\"><b>Hotkeys</b></font>
+            <br>
+            <br>
+            - <b>Pan</b>: Left mouse <br>
+            - <b>Zoom</b>: Right mouse + drag <br>
+            - <b>Reset</b>: Double-click right mouse <br>
+        """)
+
+        self._ctrl = ctrl
         self._panels = panels
         self._widgets = widgets
+        self._model = None
 
         widgets["view"].setSortingEnabled(True)
         self.setWidget(panels["central"])
@@ -519,6 +582,33 @@ class Context(AbstractDockWidget):
         proxy_model = QtCore.QSortFilterProxyModel()
         proxy_model.setSourceModel(model_)
         self._widgets["view"].setModel(proxy_model)
+        self._model = model_
+
+    def on_generate_clicked(self):
+        pixmap = self._ctrl.graph()
+
+        if not pixmap:
+            self._widgets["graphHotkeys"].setText(
+                "<b>GraphViz not found</b>"
+                "<br>"
+                "<br>"
+                "This feature requires `dot` on PATH<br>"
+                "See <a href=https://allzpark.com>allzpark.com</a> "
+                "for details."
+            )
+            self._widgets["generateGraph"].hide()
+            return
+
+        self._widgets["graph"].setImage(pixmap)
+        self._widgets["graph"]._pixmapHandle.setGraphicsEffect(None)
+
+    def on_application_changed(self):
+        if not self._widgets["graph"]._pixmapHandle:
+            return
+
+        grayscale = QtWidgets.QGraphicsColorizeEffect()
+        grayscale.setColor(QtGui.QColor(0, 0, 0))
+        self._widgets["graph"]._pixmapHandle.setGraphicsEffect(grayscale)
 
 
 class Environment(AbstractDockWidget):
@@ -605,9 +695,6 @@ class Commands(AbstractDockWidget):
 
         widgets = {
             "view": SlimTableView(),
-            "command": QtWidgets.QLineEdit(),
-            "stdout": QtWidgets.QListView(),
-            "stderr": QtWidgets.QListView(),
         }
 
         layout = QtWidgets.QVBoxLayout(panels["central"])
@@ -621,31 +708,18 @@ class Commands(AbstractDockWidget):
 
         layout = QtWidgets.QVBoxLayout(panels["footer"])
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(widgets["command"])
-        # layout.addWidget(widgets["stderr"])
-        # layout.addWidget(widgets["stderr"])
 
         widgets["view"].setSortingEnabled(True)
         widgets["view"].customContextMenuRequested.connect(self.on_right_click)
-        widgets["command"].setReadOnly(True)
 
         self._panels = panels
         self._widgets = widgets
 
         self.setWidget(panels["central"])
 
-    def on_selection_changed(self, selected, deselected):
-        selected = selected.indexes()[0]
-        model = selected.model()
-        cmd = model.data(selected, "niceCmd")
-        self._widgets["command"].setText(cmd)
-
     def set_model(self, model_):
         proxy_model = model.ProxyModel(model_)
         self._widgets["view"].setModel(proxy_model)
-
-        smodel = self._widgets["view"].selectionModel()
-        smodel.selectionChanged.connect(self.on_selection_changed)
 
     def on_right_click(self, position):
         view = self._widgets["view"]
@@ -658,19 +732,7 @@ class Commands(AbstractDockWidget):
         model = index.model()
 
         menu = QtWidgets.QMenu(self)
-        kill = QtWidgets.QAction("Kill", menu)
-        copy_command = QtWidgets.QAction("Copy command", menu)
         copy_pid = QtWidgets.QAction("Copy pid", menu)
-
-        def on_kill():
-            name = model.data(index, "cmd")
-            if not model.data(index, "running"):
-                self.message.emit("%s isn't running" % name)
-                return
-
-            self.message.emit("Killing %s" % name)
-            command = model.data(index, "object")
-            command.kill()
 
         def on_copy_pid():
             clipboard = QtWidgets.QApplication.instance().clipboard()
@@ -679,18 +741,11 @@ class Commands(AbstractDockWidget):
             clipboard.setText(pid)
             self.message.emit("Copying %s" % pid)
 
-        def on_copy_command():
-            clipboard = QtWidgets.QApplication.instance().clipboard()
-            cmd = model.data(index, "niceCmd")
-            clipboard.setText(cmd)
-            self.message.emit("Copying %s" % cmd)
+        if model.data(index, "running") != "killed":
+            copy_pid.triggered.connect(on_copy_pid)
+        else:
+            copy_pid.setEnabled(False)
 
-        kill.triggered.connect(on_kill)
-        kill.triggered.connect(on_copy_command)
-        kill.triggered.connect(on_copy_pid)
-
-        menu.addAction(kill) if os.name != "nt" else None
-        menu.addAction(copy_command)
         menu.addAction(copy_pid)
         menu.move(QtGui.QCursor.pos())
 
@@ -736,6 +791,17 @@ class EnvironmentEditor(QtWidgets.QWidget):
         self.on_focus_lost()
 
     def from_environment(self, environ):
+        if not environ:
+            return self._widgets["textEdit"].setPlainText("""\
+# Provide your own additional environment variables here
+#
+# MY_VARIABLE=1
+# YOUR_VARIABLE=2
+#
+# NOTE: Variables are applied *before* the context, which
+# means your packages overwrite anything you provide here.
+""")
+
         text = "\n".join([
             "%s=%s" % (key, value)
             for key, value in environ.items()
@@ -837,8 +903,8 @@ class Preferences(AbstractDockWidget):
     icon = "Action_GoHome_32"
 
     options = [
-        qargparse.Info("startupProject", help=(
-            "Load this project on startup"
+        qargparse.Info("startupProfile", help=(
+            "Load this profile on startup"
         )),
         qargparse.Info("startupApplication", help=(
             "Load this application on startup"
@@ -870,7 +936,7 @@ class Preferences(AbstractDockWidget):
         )),
         qargparse.Boolean("showAllApps", help=(
             "List everything from allzparkconfig:applications\n"
-            "not just the ones specified for a given project."
+            "not just the ones specified for a given profile."
         )),
         qargparse.Boolean("showHiddenApps", help=(
             "Show apps with metadata['hidden'] = True"
@@ -882,6 +948,25 @@ class Preferences(AbstractDockWidget):
             "such as *.beta packages, with every other package still \n"
             "qualifying for that filter."
         )),
+        qargparse.Integer("clearCacheTimeout", minimum=1, default=10, help=(
+            "Clear package repository cache at this interval, in seconds. \n\n"
+
+            "Default 10. (Requires restart)\n\n"
+
+            "Normally, filesystem calls like `os.listdir` are cached \n"
+            "so as to avoid unnecessary calls. However, whenever a new \n"
+            "version of a package is released, it will remain invisible \n"
+            "until this cache is cleared. \n\n"
+
+            "Clearing ths cache should have a very small impact on \n"
+            "performance and is safe to do frequently. It has no effect \n"
+            "on memcached which has a much greater impact on performanc."
+        )),
+
+        qargparse.String(
+            "exclusionFilter",
+            default=allzparkconfig.exclude_filter,
+            help="Exclude versions that match this expression"),
 
         qargparse.Separator("System"),
 
@@ -964,6 +1049,8 @@ class SlimTableView(QtWidgets.QTableView):
         self.verticalHeader().hide()
         self.setSelectionMode(self.SingleSelection)
         self.setSelectionBehavior(self.SelectRows)
+        self.setVerticalScrollMode(self.ScrollPerPixel)
+        self.setHorizontalScrollMode(self.ScrollPerPixel)
         self._stretch = 0
         self._previous_sort = 0
 
@@ -1022,16 +1109,118 @@ class SlimTableView(QtWidgets.QTableView):
                 self.customContextMenuRequested.emit(event.pos())
 
 
+class PushButtonWithMenu(QtWidgets.QPushButton):
+    def __init__(self, *args, **kwargs):
+        super(PushButtonWithMenu, self).__init__(*args, **kwargs)
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+
+    def mousePressEvent(self, event):
+        """Do request a context menu, but on mouse *press*, not release"""
+
+        # Important, call this first to have the item be selected,
+        # as per default, and *then* ask for a context menu. That
+        # way, the menu and selection aligns.
+        try:
+            return super(PushButtonWithMenu, self).mousePressEvent(event)
+
+        finally:
+            if event.button() == QtCore.Qt.RightButton:
+                self.customContextMenuRequested.emit(event.pos())
+
+
+class LineEditWithCompleter(QtWidgets.QLineEdit):
+    changed = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super(LineEditWithCompleter, self).__init__(parent)
+
+        proxy = QtCore.QSortFilterProxyModel(self)
+        proxy.setFilterCaseSensitivity(QtCore.Qt.CaseInsensitive)
+
+        completer = QtWidgets.QCompleter(proxy, self)
+        completer.setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+        completer.setCompletionMode(completer.UnfilteredPopupCompletion)
+        completer.setMaxVisibleItems(15)
+
+        self.setCompleter(completer)
+        self.editingFinished.connect(self.onEditingFinished)
+
+        self._completer = completer
+        self._focused = False
+        self._proxy = proxy
+        self._current = None
+
+    def setModel(self, model):
+        self._proxy.setSourceModel(model)
+        self._completer.setModel(self._proxy)
+
+    def setText(self, text):
+
+        # Keep track of a "default" such that we can revert back to
+        # it following a bad completion.
+        self._current = text
+
+        return super(LineEditWithCompleter, self).setText(text)
+
+    def resetText(self):
+        self.setText(self._current)
+
+    def mousePressEvent(self, event):
+        super(LineEditWithCompleter, self).mousePressEvent(event)
+
+        # Automatically show dropdown on select
+        self._completer.complete()
+        self.selectAll()
+
+    def onEditingFinished(self):
+        # For whatever reason, the completion prefix isn't updated
+        # when coming from the user selecting an item from the
+        # completion listview. (Windows 10, PySide2, Python 3.7)
+        self._completer.setCompletionPrefix(self.text())
+
+        suggested = self._completer.currentCompletion()
+
+        if not suggested:
+            return self.resetText()
+
+        self.changed.emit(suggested)
+
+
 class MenuWithTooltip(QtWidgets.QMenu):
     """QMenu typically doesn't draw tooltips"""
 
     def event(self, event):
         if event.type() == QtCore.QEvent.ToolTip and self.activeAction() != 0:
-            QtWidgets.QToolTip.showText(
-                event.globalPos(),
-                self.activeAction().toolTip()
-            )
-        else:
+
+            try:
+                tooltip = self.activeAction().toolTip()
+            except AttributeError:
+                # Can sometimes return None
+                pass
+            else:
+                QtWidgets.QToolTip.showText(
+                    event.globalPos(),
+                    tooltip
+                )
+
+        # Account for QStatusBar queries about tooltip
+        # These typically are only available on hovering
+        # an action for some time, which isn't reflected
+        # in querying the menu itself for a tooltip.
+        elif event.type() == QtCore.QEvent.MouseMove:
+            try:
+                tooltip = self.activeAction().toolTip()
+
+                # Some tooltips are multi-line, and the statusbar
+                # typically ignores newlines and writes it all out
+                # as one long line.
+                tooltip = tooltip.splitlines()[0]
+
+                self.setToolTip(tooltip)
+
+            except (AttributeError, IndexError):
+                pass
+
             QtWidgets.QToolTip.hideText()
 
         return super(MenuWithTooltip, self).event(event)

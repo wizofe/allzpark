@@ -12,7 +12,7 @@ import subprocess
 
 from collections import OrderedDict as odict
 
-from .vendor.Qt import QtCore
+from .vendor.Qt import QtCore, QtGui
 from .vendor import transitions
 from . import model, util, allzparkconfig
 
@@ -27,6 +27,7 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 Latest = None  # Enum
+NoVersion = None
 
 
 class State(dict):
@@ -43,12 +44,10 @@ class State(dict):
 
     def __init__(self, ctrl, storage):
         super(State, self).__init__({
-            "projectName": storage.value("startupProject"),
-            "projectVersion": None,
-            "appName": storage.value("startupApplication"),
-            "appVersion": None,
+            "profileName": storage.value("startupProfile"),
+            "appRequest": storage.value("startupApplication"),
 
-            # String or callable, returning list of project names
+            # String or callable, returning list of profile names
             "root": None,
 
             # Current error, if any
@@ -57,12 +56,20 @@ class State(dict):
             # Currently commands applications
             "commands": [],
 
-            # Previously loaded project Rez packages
-            "rezProjects": {},
+            # Previously loaded profile Rez packages
+            "rezProfiles": {},
 
             # Currently loaded Rez contexts
             "rezContexts": {},
+
+            # Cache, for performance only
+            "rezEnvirons": {},
+
             "rezApps": odict(),
+            "fullCommand": "rez env",
+            "serialisationMode": (
+                storage.value("serialisationMode") or "used_request"
+            ),
         })
 
         self._ctrl = ctrl
@@ -106,27 +113,27 @@ class State(dict):
         return value
 
     def on_enter_booting(self):
-        self._ctrl.info("Booting..")
+        self._ctrl.debug("Booting..")
 
-    def on_enter_selectproject(self):
+    def on_enter_selectprofile(self):
         pass
 
     def on_enter_resolving(self):
         pass
 
     def on_enter_launching(self):
-        self._ctrl.info("Application is being launched..")
+        self._ctrl.debug("Application is being launched..")
         util.delay(self.to_ready, 500)
 
     def on_enter_noapps(self):
-        project = self["projectName"]
-        self._ctrl.info("No applications were found for %s" % project)
+        profile = self["profileName"]
+        self._ctrl.debug("No applications were found for %s" % profile)
 
     def on_enter_loading(self):
-        self._ctrl.info("Loading..")
+        self._ctrl.debug("Loading..")
 
     def on_enter_ready(self):
-        self._ctrl.info("Ready")
+        self._ctrl.debug("Ready")
 
 
 class _State(transitions.State):
@@ -147,6 +154,23 @@ class _State(transitions.State):
         return not self.__eq__(other)
 
 
+class _Stream(object):
+    def __init__(self, ctrl, stream, level):
+        self._ctrl = ctrl
+        self._stream = stream
+        self._level = level
+
+    def write(self, text):
+        self._stream.write(text.rstrip()) if self._stream else None
+        self._ctrl.logged.emit(text, self._level)
+
+    def fileno(self):
+        return 0
+
+    def close(self):
+        return
+
+
 class Controller(QtCore.QObject):
     state_changed = QtCore.Signal(_State)
     logged = QtCore.Signal(str, int)  # message, level
@@ -155,8 +179,15 @@ class Controller(QtCore.QObject):
     # One or more packages have changed on disk
     repository_changed = QtCore.Signal()
 
-    project_changed = QtCore.Signal(
-        str, str, bool)  # project, version, refreshed
+    profile_changed = QtCore.Signal(
+        str, object, bool)  # profile, version, refreshed
+
+    application_changed = QtCore.Signal()
+
+    # The current command to launch an application has changed
+    command_changed = QtCore.Signal(str)  # command
+
+    patch_changed = QtCore.Signal(str)  # full patch string
 
     states = [
         _State("booting", help="ALLZPARK is booting, hold on"),
@@ -165,25 +196,25 @@ class Controller(QtCore.QObject):
         _State("errored", help="Something has gone wrong"),
         _State("launching", help="An application is launching"),
         _State("ready", help="Awaiting user input"),
-        _State("noproject", help="A given project package was not found"),
+        _State("noprofiles", help="Allzpark did not find any profiles at all"),
         _State("noapps", help="There were no applications to choose from"),
         _State("notresolved", help="Rez couldn't resolve a request"),
         _State("pkgnotfound", help="One or more packages was not found"),
     ]
 
-    def __init__(self, storage, parent=None):
+    def __init__(self, storage, stdio=None, stderr=None, parent=None):
         super(Controller, self).__init__(parent)
 
         state = State(self, storage)
 
         models = {
-            "projectVersions": QtCore.QStringListModel(),
-            "projectNames": QtCore.QStringListModel(),
+            "profileVersions": QtCore.QStringListModel(),
+            "profileNames": QtCore.QStringListModel(),
             "apps": model.ApplicationModel(),
 
             # Docks
-            "packages": model.PackagesModel(),
-            "context": model.JsonModel(),
+            "packages": model.PackagesModel(self),
+            "context": model.ContextModel(),
             "environment": model.EnvironmentModel(),
             "commands": model.CommandsModel(),
         }
@@ -206,6 +237,7 @@ class Controller(QtCore.QObject):
             auto_transitions=True,
         )
 
+        self._timers = timers
         self._models = models
         self._storage = storage
         self._state = state
@@ -233,12 +265,12 @@ class Controller(QtCore.QObject):
         return self._state["error"]
 
     @property
-    def current_project(self):
-        return self._state["projectName"]
+    def current_profile(self):
+        return self._state["profileName"]
 
     @property
     def current_application(self):
-        return self._state["appName"]
+        return self._state["appRequest"]
 
     @property
     def current_tool(self):
@@ -248,16 +280,42 @@ class Controller(QtCore.QObject):
         return self._state["rezContexts"][app_request].to_dict()
 
     def environ(self, app_request):
-        return self._state["rezContexts"][app_request].get_environ()
+        """Fetch the environment of a context
+
+        NOTE: These can get very expensive. They call on every
+              package.py:commands() in a resolved context, which can
+              be in the tens to hundreds. Add to that the fact that
+              these functions can perform any arbitrary task, including
+              writing to disk or performing expensive calculations,
+              such as resolving their own contexts for various reasons.
+
+        TODO: This should be async, the GUI should help the user
+              understand that the environment is loading and is
+              going to be ready soon. They should also only incur
+              cost when the user is actually looking at the
+              environment tab.
+
+        """
+
+        env = self._state["rezEnvirons"]
+        ctx = self._state["rezContexts"]
+
+        try:
+            return env[app_request]
+
+        except KeyError:
+            try:
+                environ = ctx[app_request].get_environ()
+                env[app_request] = environ
+                return environ
+
+            except rez.ResolvedContextError:
+                return {
+                    "error": "Failed context"
+                }
 
     def resolved_packages(self, app_request):
         return self._state["rezContexts"][app_request].resolved_packages
-
-    def find(self, package_name, callback=lambda result: None):
-        return util.defer(
-            rez.find, args=[package_name],
-            on_success=callback
-        )
 
     # ----------------
     # Events
@@ -292,35 +350,209 @@ class Controller(QtCore.QObject):
 
         """
 
-        if rez.RexError is type:
+        # Potentially overridden by the below
+        self._state["error"] = "".join(
+            traceback.format_tb(tb) + [str(value)]
+        )
+        self._state.to_errored()
+        self.error(self._state["error"])
+
+        if rez.PackageNotFoundError is type:
+            package = value.value.rsplit(": ", 1)[-1]
+            paths = self._package_paths()
+            message = """
+                <h2><font color=\"red\">:(</font></h2>
+
+                Package '{package}' is required by this profile,
+                but could <font color=\"red\">not be found.</font>
+                <br>
+                <br>
+                I searched in these paths:
+                {paths}
+            """
+
+            self._state["error"] = message.format(
+                package=package,
+                paths="<ul>%s</ul>" % "".join(
+                    "<li>%s</li>" % path for path in paths
+                )
+            )
+
+            self._state.to_noapps()
+            return True
+
+        elif rez.PackageFamilyNotFoundError is type:
+            # package family not found: occoc (searched: C:\)
+            _, package, paths = value.value.split(": ", 2)
+            package = package.split(" (", 1)[0]
+            paths = paths.rstrip(")").split(os.pathsep)
+
+            message = """
+                <h2><font color=\"red\">:(</font></h2>
+
+                Package '{package}' is required by this profile,
+                but could <font color=\"red\">not be found.</font>
+                <br>
+                <br>
+                I searched in these paths:
+                {paths}
+            """
+
+            self._state["error"] = message.format(
+                package=package,
+                paths="<ul>%s</ul>" % "".join(
+                    "<li>%s</li>" % path for path in paths
+                )
+            )
+
+            self._state.to_noapps()
+            return True
+
+        elif rez.ResolvedContextError is type:
+            # Cannot perform operation in a failed context
+            self.error(str(value))
+            self._state.to_ready()
+            return True
+
+        elif rez.RexError is type:
             # These are re-raised as a more specific
             # exception, e.g. RexUndefinedVariableError
-            pass
+            self._state.to_errored()
 
-        if rez.RexUndefinedVariableError is type:
-            pass
+        elif rez.RexUndefinedVariableError is type:
+            self._state.to_errored()
 
-        if rez.PackageCommandError is type:
-            pass
+        elif rez.PackageCommandError is type:
+            self._state.to_errored()
 
-        self.error("".join(traceback.format_tb(tb)))
-        self.error(str(value))
-        self._state.to_errored()
+        elif rez.PackageRequestError is type:
+            message = "<h2><font color=\"red\">:(</font></h2>%s"
+            self._state["error"] = message % value
+            self._state.to_noapps()
+
+        self.error(self._state["error"])
 
     # ----------------
     # Methods
     # ----------------
 
+    def stdio(self, stream, level=logging.INFO):
+        return _Stream(self, stream, level)
+
+    def find(self, family, range_=None):
+        """Find packages, relative Allzpark state
+
+        Arguments:
+            family (str): Name of package
+            range (str): Range, e.g. "1" or "==0.3.13"
+
+        """
+
+        package_filter = self._package_filter()
+        paths = self._package_paths()
+        it = rez.find(family, range_, paths=paths)
+        it = sorted(
+            it,
+
+            # Make e.g. 1.10 appear after 1.9
+            key=lambda p: util.natural_keys(str(p.version))
+        )
+
+        for pkg in it:
+            if package_filter.excludes(pkg):
+                self.debug("Excluding %s==%s.." % (pkg.name, pkg.version))
+                continue
+
+            yield pkg
+
+    def env(self, request, use_filter=True):
+        """Resolve context, relative Allzpark state
+
+        Arguments:
+            request (str): Fully formatted request, including any
+                number of packages. E.g. "six==1.2 PySide2"
+            use_filter (bool, optional): Whether or not to apply
+                the current package_filter
+
+        """
+
+        package_filter = self._package_filter()
+        paths = self._package_paths()
+
+        return rez.env(
+            request,
+            package_paths=paths,
+            package_filter=package_filter if use_filter else None
+        )
+
+    def update_command(self, mode=None):
+        if mode:
+            self._state["serialisationMode"] = mode
+            self._state.store("serialisationMode", mode)
+
+        if self._state["appRequest"] not in self._state["rezContexts"]:
+            # In this case, we have no context, so there
+            # is very little to actually try and reproduce
+            self._state["fullCommand"] = ""
+            return self.command_changed.emit("")
+
+        mode = self._state["serialisationMode"]
+        app = self._state["appRequest"]
+        context = self._state["rezContexts"][app]
+        tool = self._state["tool"]
+        exclude = allzparkconfig.exclude_filter
+
+        if mode == "used_resolve":
+            packages = [
+                "%s==%s" % (pkg.name, pkg.version)
+                for pkg in context.resolved_packages or []
+            ]
+
+        else:
+            packages = [str(pkg) for pkg in context.requested_packages()]
+
+        command = ["rez", "env"]
+        command += packages
+
+        if exclude:
+            command += ["--exclude", exclude]
+
+        # Ensure consistency during re-resolve
+        # Important for submitting contexts across
+        # machines at different times
+        command += ["--time", str(context.timestamp)]
+
+        if localz and not self._state.retrieve("useLocalizedPackages", True):
+            paths = os.pathsep.join(self._package_paths())
+            command += ["--paths"] + ["\"%s\"" % paths]
+
+        elif not self._state.retrieve("useDevelopmentPackages"):
+            command += ["--no-local"]
+
+        command += ["--", tool]
+
+        self._state["fullCommand"] = " ".join(command)
+        self.command_changed.emit(self._state["fullCommand"])
+
+    def _package_filter(self):
+        package_filter = rez.PackageFilterList.singleton.copy()
+
+        if allzparkconfig.exclude_filter:
+            rule = rez.Rule.parse_rule(allzparkconfig.exclude_filter)
+            package_filter.add_exclusion(rule)
+
+        return package_filter
+
     @util.async_
     def reset(self, root=None, on_success=lambda: None):
         """Initialise controller with `root`
 
-        Projects are listed at `root` and matched
+        Profiles are listed at `root` and matched
         with its corresponding Rez package.
 
         Arguments:
-            root (str): Absolute path to projects on disk, or callable
-                returning names of projects
+            root (str): Absolute path to profiles on disk, or callable
+                returning names of profiles
 
         """
 
@@ -329,69 +561,78 @@ class Controller(QtCore.QObject):
         assert root, "Tried resetting without a root, this is a bug"
 
         def do():
-            projects = dict()
-            default_project = None
+            profiles = dict()
+            default_profile = None
 
-            for name in self.list_projects(root):
+            for name in self.list_profiles(root):
 
-                # Find project package
+                # Find profile package
                 package = None
-                for package in sorted(rez.find(name),
-                                      key=lambda p: p.version):
+                for package in self.find(name):
 
-                    if name not in projects:
-                        projects[name] = dict()
+                    if name not in profiles:
+                        profiles[name] = dict()
 
-                    projects[name][str(package.version)] = package
-                    projects[name][Latest] = package
+                    profiles[name][str(package.version)] = package
+                    profiles[name][Latest] = package
 
                 if package is None:
-                    projects[name] = {
-                        "0.0": model.BrokenPackage(name),
-                        Latest: model.BrokenPackage(name),
+                    package = model.BrokenPackage(name)
+                    profiles[name] = {
+                        "0.0": package,
+                        Latest: package,
                     }
 
                 # Default to latest of last
-                default_project = name
+                default_profile = name
 
-            self._state["rezProjects"].update(projects)
-            self._models["projectNames"].setStringList(list(projects))
-            self._models["projectNames"].layoutChanged.emit()
+            self._state["rezProfiles"].update(profiles)
+            self._models["profileNames"].setStringList(list(profiles))
+            self._models["profileNames"].layoutChanged.emit()
 
             # On resetting after startup, there will be a
-            # currently selected project that may differ from
-            # the startup project.
-            current_project = self._state["projectName"]
+            # currently selected profile that may differ from
+            # the startup profile.
+            current_profile = self._state["profileName"]
 
-            # Find last used project from user preferences
-            if not current_project:
-                current_project = self._state.retrieve("startupProject")
+            if current_profile and current_profile not in profiles:
+                self.warning("Startup profile '%s' did not exist"
+                             % current_profile)
+                current_profile = None
 
             # The user has never opened the GUI before,
             # or user preferences has been wiped.
-            if not current_project:
-                current_project = default_project
+            if not current_profile:
+                current_profile = default_profile
 
-            # Fallback
-            if not current_project:
-                current_project = "No project"
-
-            self._state["projectName"] = current_project
+            self._state["profileName"] = current_profile
             self._state["root"] = root
 
             self._state.to_ready()
             self.resetted.emit()
 
         def _on_success():
-            self.select_project(self._state["projectName"])
+            profile = not self._state["profileName"]
+
+            if profile:
+                self._state.to_noprofiles()
+            else:
+                self.select_profile(profile)
+
             on_success()
 
         def _on_failure(error, trace):
-            self.error("There was a problem")
-            self.error(trace)
+            raise error
 
         self._state["rezContexts"].clear()
+        self._state["rezEnvirons"].clear()
         self._state["rezApps"].clear()
+
+        # Rez stores file listings and more
+        # in memory, in addition to memcached.
+        # This function clears the in-memory cache,
+        # so that we can pick up new packages.
+        rez.clear_caches()
 
         self._state.to_booting()
         util.defer(
@@ -400,14 +641,34 @@ class Controller(QtCore.QObject):
             on_failure=_on_failure
         )
 
+    def patch(self, new):
+        self.debug("Patching %s.." % new)
+
+        new = rez.PackageRequest(new)
+        old = odict(
+            (rez.PackageRequest(req).name, rez.PackageRequest(req))
+            for req in self._state.retrieve("patch", "").split()
+        )
+
+        if new.name in old:
+            old.pop(new.name)
+
+        if str(new.range):
+            # Otherwise, let it return to the originally resolved value
+            old[new.name] = new
+
+        patch = " ".join(str(pkg) for pkg in old.values())
+        self._state.store("patch", patch)
+        self.reset()
+
     @util.async_
     def launch(self, **kwargs):
         def do():
-            app_request = self._state["appName"]
+            app_request = self._state["appRequest"]
             rez_context = self._state["rezContexts"][app_request]
             rez_app = self._state["rezApps"][app_request]
 
-            self.info("Found app: %s=%s" % (
+            self.debug("Found app: %s=%s" % (
                 rez_app.name, rez_app.version
             ))
 
@@ -428,10 +689,15 @@ class Controller(QtCore.QObject):
             disabled = self._models["packages"]._disabled
             environ = self._state.retrieve("userEnv", {})
 
-            self.info(
+            self.debug(
                 "Launching %s%s.." % (
                     tool_name, " (detached)" if is_detached else "")
             )
+
+            def on_error(error):
+                # Forward error from Command()
+                raise error
+                # raise rez.ResolvedContextError(str(error))
 
             cmd = Command(
                 context=rez_context,
@@ -446,6 +712,9 @@ class Controller(QtCore.QObject):
 
             cmd.stdout.connect(self.info)
             cmd.stderr.connect(self.error)
+            cmd.error.connect(on_error)
+
+            cmd.execute()
 
             self._state["commands"].append(cmd)
             self._models["commands"].append(cmd)
@@ -460,25 +729,25 @@ class Controller(QtCore.QObject):
         tempdir = tempfile.mkdtemp()
 
         def do():
-            self.info("Resolving %s.." % name)
+            self.debug("Resolving %s.." % name)
             variant = localz.resolve(name)[0]  # Guaranteed to be one
 
             try:
-                self.info("Preparing %s.." % name)
+                self.debug("Preparing %s.." % name)
                 copied = localz.prepare(variant, tempdir, verbose=2)[0]
 
-                self.info("Computing size..")
+                self.debug("Computing size..")
                 size = localz.dirsize(tempdir) / (10.0 ** 6)  # mb
 
-                self.info("Localising %.2f mb.." % size)
+                self.debug("Localising %.2f mb.." % size)
                 result = localz.localize(copied,
                                          localz.localized_packages_path(),
                                          verbose=2)
 
-                self.info("Localised %s" % result)
+                self.debug("Localised %s" % result)
 
             finally:
-                self.info("Cleaning up..")
+                self.debug("Cleaning up..")
                 shutil.rmtree(tempdir)
 
         def on_success(result):
@@ -495,7 +764,7 @@ class Controller(QtCore.QObject):
         def do():
             item = self._models["packages"].find(name)
             package = item["package"]
-            self.info("Delocalizing %s" % package.root)
+            self.debug("Delocalizing %s" % package.root)
             localz.delocalize(package)
 
         def on_success(result):
@@ -513,96 +782,130 @@ class Controller(QtCore.QObject):
         return None
 
     def debug(self, message):
-        log.debug(message)
         self.logged.emit(message, logging.DEBUG)
 
     def info(self, message):
-        log.info(message)
         self.logged.emit(message, logging.INFO)
 
     def warning(self, message):
-        log.warning(message)
         self.logged.emit(message, logging.WARNING)
 
     def error(self, message):
-        log.error(message)
         self.logged.emit(str(message), logging.ERROR)
 
-    def list_projects(self, root=None):
+    def list_profiles(self, root=None):
         root = root or self._state["root"]
         assert root, "Tried listing without a root, this is a bug"
 
         if isinstance(root, (tuple, list)):
-            return root
+            profiles = root
 
-        try:
-            if callable(root):
-                projects = root()
+        elif callable(root):
+            try:
+                profiles = root()
 
-            else:
-                _, projects, _ = next(os.walk(root))
+            except Exception:
+                if log.level < logging.INFO:
+                    traceback.print_exc()
 
-                # Support directory names that use dash in place of underscore
-                projects = [p.replace("-", "_") for p in projects]
+                self.error("Could not find profiles in %s" % root)
+                profiles = []
 
-        except Exception:
-            if log.level < logging.INFO:
-                traceback.print_exc()
+        # Facilitate accidental empty family names, e.g. None or ''
+        profiles = list(filter(None, profiles))
 
-            self.error("Could not find projects in %s" % root)
-            projects = []
-
-        return projects
+        return profiles
 
     @util.async_
-    def select_project(self, project_name, version_name=Latest):
+    def select_profile(self, profile_name, version_name=Latest):
 
         # Wipe existing data
         self._models["apps"].reset()
         self._models["context"].reset()
         self._models["environment"].reset()
         self._models["packages"].reset()
-        self._models["projectVersions"].setStringList([])
+        self._models["profileVersions"].setStringList([])
 
         def on_apps_found(apps):
-            self._models["apps"].reset(apps)
-            self._state["projectName"] = project_name
+            if not apps:
+                self._state["error"] = """
+                <h2><font color=\"red\">:(</font></h2>
+                <br>
+                <br>
+                The profile was found, but no applications.
+                <br>
+                <br>
+                The profile didn't specify an application for you to use.<br>
+                This is likely due to a misconfigured profile. Don't forget<br>
+                to provide one or more packages as <i>weak references</i>.
+                <br>
+                <br>
+                See <a href=https://allzpark.com/getting-started>
+                    allzpark.com/getting-started</a> for more details.
 
-            refreshed = self._state["projectName"] == project_name
-            self.project_changed.emit(
-                str(active_project.name),
-                str(active_project.version),
-                refreshed
-            )
+                """
+                self._state.to_noapps()
 
-            self._state.to_ready()
+            else:
+                self._models["apps"].reset(apps)
+                self._state.to_ready()
 
         def on_apps_not_found(error, trace):
-            self._state.to_noapps()
-            self.error(trace)
+            # Handled by on_unhandled_exception
+            raise error
 
         try:
-            project_versions = self._state["rezProjects"][project_name]
-            active_project = project_versions[version_name]
-
-            # Update versions model
-            versions = list(filter(None, project_versions))  # Exclude "Latest"
-            self._models["projectVersions"].setStringList(versions)
-
-            self._state.to_loading()
-            util.defer(
-                self._list_apps,
-                args=[active_project],
-                on_success=on_apps_found,
-                on_failure=on_apps_not_found,
-            )
+            profile_versions = self._state["rezProfiles"][profile_name]
+            active_profile = profile_versions[version_name]
 
         except KeyError:
-            self._state.to_notresolved()
+            # This can only happen if somehow the view decided to pass
+            # along the name and version of a profile that didn't exist.
+            profile_name = self._state["profileName"]
+            profile_versions = self._state["rezProfiles"][profile_name]
+            active_profile = profile_versions[version_name]
+
+            if profile_name:
+                self.warning("%s was not found" % profile_name)
+            else:
+                self.error("select_profile was passed an empty string")
+
+        refreshed = self._state["profileName"] == profile_name
+
+        # TODO: This isn't clear.
+        # We can't pass a native Rez Version object, but we also can't
+        # simply str() that and BrokenPackage.version, as those would
+        # be None, which is the equivalent of a NoVersion object.
+        version_name = active_profile.version
+        version_name = str(version_name) if version_name else NoVersion
+
+        self._state["profileName"] = profile_name
+        self.profile_changed.emit(
+            profile_name,
+            version_name,
+            refreshed
+        )
+
+        if isinstance(active_profile, model.BrokenPackage):
+            raise rez.PackageNotFoundError(
+                "package not found: %s" % profile_name
+            )
+
+        # Update versions model
+        versions = list(filter(None, profile_versions))  # Exclude "Latest"
+        versions.reverse()  # Latest first
+        self._models["profileVersions"].setStringList(versions)
+
+        self._state.to_loading()
+        util.defer(
+            self._list_apps,
+            args=[active_profile],
+            on_success=on_apps_found,
+            on_failure=on_apps_not_found,
+        )
 
     def select_application(self, app_request):
-        self._state["appName"] = app_request
-        self.info("%s selected" % app_request)
+        self._state["appRequest"] = app_request
 
         try:
             context = self.context(app_request)
@@ -619,26 +922,48 @@ class Controller(QtCore.QObject):
         self._models["context"].load(context)
         self._models["environment"].load(environ)
 
-        # Use this application on next launch or change of project
+        tools = self._models["apps"].find(app_request)["tools"]
+        self._state["tool"] = tools[0]
+
+        # Use this application on next launch or change of profile
+        self.update_command()
         self._state.store("startupApplication", app_request)
+        self.application_changed.emit()
 
     def select_tool(self, tool_name):
-        self.debug("%s selected" % tool_name)
         self._state["tool"] = tool_name
+        self.update_command()
 
-    def _list_apps(self, project):
-        # Each app has a unique context relative the current project
+    def _package_paths(self):
+        """Return all package paths, relative the current state of the world"""
+
+        paths = util.normpaths(*rez.config.packages_path)
+
+        # Optional development packages
+        if not self._state.retrieve("useDevelopmentPackages"):
+            paths = util.normpaths(*rez.config.nonlocal_packages_path)
+
+        # Optional package localisation
+        if localz and not self._state.retrieve("useLocalizedPackages", True):
+            path = localz.localized_packages_path()
+
+            try:
+                paths.remove(util.normpath(path))
+            except ValueError:
+                # It may not be part of the path
+                pass
+
+        return paths
+
+    def _list_apps(self, profile):
+        # Each app has a unique context relative the current profile
         # Find it, and keep track of it.
 
         apps = []
         _apps = allzparkconfig.applications
 
-        paths = util.normpaths(*rez.config.packages_path)
-        if not self._state.retrieve("useDevelopmentPackages"):
-            paths = util.normpaths(*rez.config.nonlocal_packages_path)
-
         if self._state.retrieve("showAllApps") and not _apps:
-            self.info("Requires allzparkconfig.applications")
+            self.warning("Requires allzparkconfig.applications")
 
         elif self._state.retrieve("showAllApps"):
             if isinstance(_apps, (tuple, list)):
@@ -656,63 +981,40 @@ class Controller(QtCore.QObject):
                                        errno.ENOTDIR):
                         raise
 
-                    self.info("Could not show all apps, "
-                              "missing `allzparkconfig.applications`")
+                    self.warning("Could not show all apps, "
+                                 "missing `allzparkconfig.applications`")
 
         if not apps:
-            apps[:] = allzparkconfig.applications_from_package(project)
-
-        # Strip the "weak" property of the request, else iter_packages
-        # isn't able to find the requested versions.
-        apps = [rez.PackageRequest(req.strip("~")) for req in apps]
-
-        # Expand versions into their full range
-        # E.g. maya-2018|2019 == ["maya-2018", "maya-2019"]
-        all_apps = list()
-        for request in apps:
-            all_apps += rez.find(
-                request.name,
-                range_=request.range,
-                paths=paths
-            )
+            apps[:] = allzparkconfig.applications_from_package(profile)
 
         # Optional patch
         patch = self._state.retrieve("patch", "").split()
-
-        # Optional filtering
-        PackageFilterList = rez.PackageFilterList
-        package_filter = PackageFilterList.singleton.copy()
-        if allzparkconfig.exclude_filter:
-            rule = rez.Rule.parse_rule(allzparkconfig.exclude_filter)
-            package_filter.add_exclusion(rule)
-
-        # Optional package localisation
-        if localz and not self._state.retrieve("useLocalizedPackages"):
-            try:
-                paths.remove(util.normpath(
-                    localz.localized_packages_path())
-                )
-
-            except ValueError:
-                # It may not be part of the path
-                self.warning(
-                    "%s was not found on your "
-                    "package path." % localz.localized_packages_path()
-                )
+        package_filter = self._package_filter()
+        app_packages = []
 
         contexts = odict()
         with util.timing() as t:
-            for app_package in all_apps:
-                variants = list(project.iter_variants())
+            for app_request in apps:
+                app_request = rez.PackageRequest(app_request)
+                app_package = rez.find_latest(app_request.name,
+                                              range_=app_request.range)
+
+                if package_filter.excludes(app_package):
+                    continue
+
+                variants = list(profile.iter_variants())
                 variant = variants[0]
+
+                # Keep for later
+                app_packages += [app_package]
 
                 if len(variants) > 1:
                     # Unsure of whether this is desirable. It would enable
-                    # a project per platform, or potentially other kinds
+                    # a profile per platform, or potentially other kinds
                     # of special-purpose situations. If you see this,
                     # and want this, submit an issue with your use case!
                     self.warning(
-                        "Projects with multiple variants are unsupported. "
+                        "Profiles with multiple variants are unsupported. "
                         "Using first found: %s" % variant
                     )
 
@@ -720,37 +1022,17 @@ class Controller(QtCore.QObject):
                                           app_package.version)
 
                 request = [variant.qualified_package_name, app_request]
-                self.info("Resolving request: %s" % " ".join(request))
+                self.debug("Resolving request: %s" % " ".join(request))
 
-                try:
-                    context = rez.env(
-                        request,
-                        package_paths=paths,
-                        package_filter=package_filter,
-                    )
+                context = self.env(request)
 
-                except rez.RezError:
-                    context = model.BrokenContext(app_request, request)
-                    context.failure_description = traceback.format_exc()
-                    self.error(traceback.format_exc())
-
-                if not context.success:
-                    # Happens on failed resolve, e.g. version conflict
-                    description = context.failure_description
-                    context = model.BrokenContext(app_request, request)
-                    context.failure_description = description
-                    self.error(description)
-
-                if patch and not isinstance(context, model.BrokenContext):
-                    self.info("Patching request: %s" % " ".join(request))
+                if context.success and patch:
+                    self.debug("Patching request: %s" % " ".join(request))
                     request = context.get_patched_request(patch)
-                    context = rez.env(
+                    context = self.env(
                         request,
-                        package_paths=paths,
-                        package_filter=(
-                            package_filter
-                            if self._state.retrieve("patchWithFilter", True)
-                            else None
+                        use_filter=self._state.retrieve(
+                            "patchWithFilter", False
                         )
                     )
 
@@ -766,9 +1048,32 @@ class Controller(QtCore.QObject):
                 )
 
             except StopIteration:
-                # Can happen with a patched context, where the application
-                # itself is patched away. E.g. "^maya". This is a user error.
                 rez_pkg = model.BrokenPackage(app_request)
+
+                self.warning(
+                    "Couldn't find a corresponding package for "
+                    "application %s. This can happen if an application is "
+                    "patched away, using the ^-operator."
+                    % app_request
+                )
+
+            except TypeError:
+                # resolved_packages was None, a sign that a context was broken
+                rez_pkg = model.BrokenPackage(app_request)
+
+                if rez_context.success:
+                    self.warning(
+                        "This shouldn't have happened, "
+                        "I was expecting a broken context here. "
+                        "Please report this to "
+                        "https://github.com/mottosso/allzpark/issues/66"
+                    )
+
+                self.error(
+                    "Context for '%s' had no resolved packages, this is "
+                    "likely due to a version conflict and broken resolve. "
+                    "Try graphing it." % app_request
+                )
 
             self._state["rezApps"][app_request] = rez_pkg
 
@@ -776,37 +1081,49 @@ class Controller(QtCore.QObject):
 
         # Find resolved app version
         # E.g. maya -> maya-2018.0.1
-        app_packages = []
         show_hidden = self._state.retrieve("showHiddenApps")
-        for app_request, context in contexts.items():
-            for package in context.resolved_packages:
-                if package.name in [a.name for a in all_apps]:
-                    break
-            else:
-                raise ValueError(
-                    "Could not find package for app %s" % app_request
-                )
-
+        for package in app_packages[:]:
             data = allzparkconfig.metadata_from_package(package)
             hidden = data.get("hidden", False)
 
             if hidden and not show_hidden:
                 package.hidden = True
-                continue
+                app_packages.remove(package)
 
             if isinstance(context, model.BrokenContext):
                 package.broken = True
 
-            app_packages += [package]
-
         self._state["rezContexts"] = contexts
         return app_packages
+
+    def graph(self):
+        context = self._state["rezContexts"][self._state["appRequest"]]
+        graph_str = context.graph(as_dot=True)
+
+        tempdir = tempfile.mkdtemp()
+        fname = os.path.join(tempdir, "graph.png")
+
+        try:
+            rez.save_graph(graph_str, fname)
+            pixmap = QtGui.QPixmap(fname)
+
+        except IOError:
+            self.error("GraphViz not found")
+            return QtGui.QPixmap()
+
+        finally:
+            # Don't need this no more
+            shutil.rmtree(tempdir)
+
+        return pixmap
 
 
 class Command(QtCore.QObject):
     stdout = QtCore.Signal(str)
     stderr = QtCore.Signal(str)
     killed = QtCore.Signal()
+
+    error = QtCore.Signal(Exception)
 
     def __str__(self):
         return "Command('%s')" % self.cmd
@@ -822,8 +1139,8 @@ class Command(QtCore.QObject):
                  parent=None):
         super(Command, self).__init__(parent)
 
-        self.overrides = overrides or {}
-        self.disabled = disabled or {}
+        self.overrides = overrides or {}  # unused
+        self.disabled = disabled or {}  # unused
         self.environ = environ or {}
 
         self.context = context
@@ -835,21 +1152,12 @@ class Command(QtCore.QObject):
         # between class and argument
         self.cmd = command
 
-        self.nicecmd = "rez env {request} -- {cmd}".format(
-            request=" ".join(
-                str(pkg)
-                for pkg in context.requested_packages()
-            ),
-            cmd=command
-        )
-
         self._running = False
 
         # Launching may take a moment, and there's no need
         # for the user to wait around for that to happen.
-        thread = threading.Thread(target=self.execute)
+        thread = threading.Thread(target=self._execute)
         thread.daemon = True
-        thread.start()
 
         self.thread = thread
 
@@ -859,6 +1167,9 @@ class Command(QtCore.QObject):
             return self.popen.pid
 
     def execute(self):
+        self.thread.start()
+
+    def _execute(self):
         kwargs = {
             "command": self.cmd,
             "stdout": subprocess.PIPE,
@@ -869,55 +1180,6 @@ class Command(QtCore.QObject):
 
         context = self.context
 
-        # Output to console
-        log.info("Console command: %s" % self.nicecmd)
-
-        if self.overrides or self.disabled:
-            # Apply overrides to a new context, to preserve the original
-            context = rez.env(context.requested_packages())
-            packages = context.resolved_packages[:]
-
-            name_to_package_lut = {
-                package.name: package
-                for package in packages
-            }
-
-            for name, version in self.overrides.items():
-                try:
-                    original = name_to_package_lut[name]
-                except KeyError:
-                    # Override not part of this context, that's fine
-                    continue
-
-                # Find a replacement, taking implciit variants into account
-                request = "%s-%s" % (name, version)
-                replacement = rez.env([request])
-                replacement = {
-                    package.name: package
-                    for package in replacement.resolved_packages
-                }[name]
-
-                packages.remove(original)
-                packages.append(replacement)
-
-                log.info("Overriding %s.%s -> %s.%s" % (
-                    name, original.version,
-                    name, replacement.version
-                ))
-
-            for package_name in self.disabled:
-                package = name_to_package_lut[package_name]
-
-                try:
-                    packages.remove(package)
-                except ValueError:
-                    # It wasn't in there, and that's OK
-                    continue
-
-                log.info("Disabling %s" % package_name)
-
-            context.resolved_packages[:] = packages
-
         if self.environ:
             # Inject user environment
             #
@@ -927,7 +1189,10 @@ class Command(QtCore.QObject):
             # by a package. Win some lose some
             kwargs["parent_environ"] = dict(os.environ, **self.environ)
 
-        self.popen = context.execute_shell(**kwargs)
+        try:
+            self.popen = context.execute_shell(**kwargs)
+        except Exception as e:
+            return self.error.emit(e)
 
         for target in (self.listen_on_stdout,
                        self.listen_on_stderr):

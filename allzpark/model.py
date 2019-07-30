@@ -23,28 +23,26 @@ but not vice versa as that would implicate a view when using it standalone.
 
 ### Architecture
 
-1. Projects are `os.listdir` from disk
-2. A project is chosen by the user, e.g. ATC
+1. Profiles are `os.listdir` from disk
+2. A profile is chosen by the user, e.g. ATC
 3. The "ATC" Rez package is discovered and queried for "apps"
-4. Each "app" is resolved alongside the current project,
+4. Each "app" is resolved alongside the current profile,
     providing dependencies, environment, label, icon and
     ultimately a context within which to launch a given
     application.
 
 """
 
+import re
 import os
 import logging
 import itertools
 
-import rez.packages_
-import rez.package_filter
-import rez.resolved_context
-from rez.config import config
+from . import allzparkconfig, util, resources as res
+from . import _rezapi as rez
 
 from .vendor.Qt import QtCore, QtGui, QtCompat
 from .vendor import qjsonmodel, six
-from . import allzparkconfig, util
 
 # Optional third-party dependencies
 try:
@@ -60,6 +58,8 @@ Finish = None
 DisplayRole = QtCore.Qt.DisplayRole
 IconRole = QtCore.Qt.DecorationRole
 LocalizingRole = QtCore.Qt.UserRole + 1
+BetaRole = QtCore.Qt.UserRole + 2
+LatestRole = QtCore.Qt.UserRole + 3
 
 
 class AbstractTableModel(QtCore.QAbstractTableModel):
@@ -176,6 +176,10 @@ class ApplicationModel(AbstractTableModel):
         "version"
     ]
 
+    def __init__(self, *args, **kwargs):
+        super(ApplicationModel, self).__init__(*args, **kwargs)
+        self._broken_icon = res.icon("Action_Stop_1_32.png")
+
     def reset(self, applications=None):
         applications = applications or []
 
@@ -214,16 +218,9 @@ class ApplicationModel(AbstractTableModel):
 
         self.endResetModel()
 
-    def flags(self, index):
-        model = index.model()
-
-        if model.data(index, "broken"):
-            return QtCore.Qt.ItemIsEnabled
-
-        return super(ApplicationModel, self).flags(index)
-
     def data(self, index, role):
         row = index.row()
+        col = index.column()
 
         try:
             data = self.items[row]
@@ -234,6 +231,23 @@ class ApplicationModel(AbstractTableModel):
             if role == QtCore.Qt.ForegroundRole:
                 return QtGui.QColor("gray")
 
+        if data["broken"]:
+            if role == QtCore.Qt.ForegroundRole:
+                return QtGui.QColor("red")
+
+            if role == QtCore.Qt.FontRole:
+                font = QtGui.QFont()
+                font.setBold(True)
+                return font
+
+            if role == QtCore.Qt.DisplayRole:
+                if col == 0:
+                    return data["label"] + " (failed)"
+
+            if role == IconRole:
+                if col == 0:
+                    return self._broken_icon
+
         return super(ApplicationModel, self).data(index, role)
 
 
@@ -241,6 +255,7 @@ class BrokenContext(object):
     def __init__(self, app_name, request):
         self.resolved_packages = [BrokenPackage(app_name)]
         self.success = False
+        self.timestamp = 0
 
         self._request = request
 
@@ -258,21 +273,30 @@ class BrokenPackage(object):
     def __str__(self):
         return self.name
 
-    def __init__(self, name):
-        self.name = name
+    def __init__(self, request):
+        request = rez.PackageRequest(request)
+        versions = request.range.to_versions() or [None]
+
+        self.name = request.name
+        self.version = versions[-1]
         self.uri = ""
+        self.root = ""
+        self.relocatable = False
         self.requires = []
-        self.version = "0.0"
         self.resource = type(
             "BrokenResource", (object,), {"repository_type": None}
         )()
+
+        self._data = {
+            "label": request.name,
+        }
 
 
 def is_local(pkg):
     if pkg.resource.repository_type != "filesystem":
         return False
 
-    local_path = config.local_packages_path
+    local_path = rez.config.local_packages_path
     local_path = os.path.abspath(local_path)
     local_path = os.path.normpath(local_path)
 
@@ -297,25 +321,33 @@ class PackagesModel(AbstractTableModel):
         0: {
             QtCore.Qt.DisplayRole: "label",
             QtCore.Qt.DecorationRole: "icon",
-            LocalizingRole: "localizing",
         },
         1: {
             QtCore.Qt.DisplayRole: "version",
         },
         2: {
             QtCore.Qt.DisplayRole: "state",
-        }
+        },
+        3: {
+            QtCore.Qt.DisplayRole: "latest",
+        },
+        4: {
+            QtCore.Qt.DisplayRole: "beta",
+        },
     }
 
     Headers = [
         "package",
         "version",
         "state",
+        "latest",
+        "beta",
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, ctrl, parent=None):
         super(PackagesModel, self).__init__(parent)
 
+        self._ctrl = ctrl
         self._overrides = {}
         self._disabled = {}
 
@@ -324,6 +356,10 @@ class PackagesModel(AbstractTableModel):
 
         self.beginResetModel()
         self.items[:] = []
+
+        # TODO: This isn't nice. The model should
+        # not have to reach into the controller.
+        paths = self._ctrl._package_paths()
 
         for pkg in packages:
             root = os.path.dirname(pkg.uri)
@@ -335,21 +371,30 @@ class PackagesModel(AbstractTableModel):
             )
             relocatable = False
 
+            version = str(pkg.version)
+
+            # Fetch all versions of package
+            versions = rez.find(pkg.name, paths=paths)
+            versions = sorted(
+                [str(v.version) for v in versions],
+                key=util.natural_keys
+            )
+
             if localz:
                 relocatable = localz.is_relocatable(pkg)
 
             item = {
                 "name": pkg.name,
                 "label": data["label"],
-                "version": str(pkg.version),
-                "default": str(pkg.version),
+                "version": version,
+                "default": version,
                 "icon": parse_icon(root, template=data["icon"]),
                 "package": pkg,
                 "override": self._overrides.get(pkg.name),
                 "disabled": self._disabled.get(pkg.name, False),
                 "context": None,
                 "active": True,
-                "versions": None,
+                "versions": versions,
                 "state": state,
                 "relocatable": relocatable,
                 "localizing": False,  # in progress
@@ -391,10 +436,6 @@ class PackagesModel(AbstractTableModel):
                 return QtGui.QColor("darkorange")
 
         try:
-            if role == "versions" and data["versions"] is None:
-                versions = list(rez.packages_.iter_packages(data["name"]))
-                data["versions"] = sorted([str(v.version) for v in versions])
-
             return data[role]
 
         except KeyError:
@@ -402,6 +443,15 @@ class PackagesModel(AbstractTableModel):
                 key = self.ColumnToKey[col][role]
             except KeyError:
                 return None
+
+        if key == "beta":
+            version = data["override"] or data["version"]
+            return "x" if re.findall(r".beta$", version) else ""
+
+        if key == "latest":
+            version = data["override"] or data["version"]
+            latest = data["versions"][-1]
+            return "x" if version == latest else ""
 
         return data[key]
 
@@ -447,7 +497,6 @@ class CommandsModel(AbstractTableModel):
         0: {
             QtCore.Qt.DisplayRole: "cmd",
             QtCore.Qt.DecorationRole: "icon",
-            QtCore.Qt.UserRole + 1: "niceCmd",
         },
         1: {
             QtCore.Qt.DisplayRole: "running",
@@ -468,7 +517,6 @@ class CommandsModel(AbstractTableModel):
         self.beginInsertRows(QtCore.QModelIndex(), index, index + 1)
         self.items.append({
             "cmd": command.cmd,
-            "niceCmd": command.nicecmd,
             "pid": None,
             "running": "waiting..",
             "icon": parse_icon(root, template=data["icon"]),
@@ -508,6 +556,10 @@ class EnvironmentModel(JsonModel):
             data[key] = value
 
         super(EnvironmentModel, self).load(data)
+
+
+class ContextModel(JsonModel):
+    pass
 
 
 class TriStateSortFilterProxyModel(QtCore.QSortFilterProxyModel):

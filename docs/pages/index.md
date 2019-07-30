@@ -4,19 +4,28 @@ template: landing.html
 
 <div class="hboxlayout" id="landing">
     <div class="vboxlayout">
-        <br>
-        <br>
         <div class="container"><p id="title">Allzpark</p></div>
-        <br>
+        <p>
+            <img src=https://img.shields.io/badge/-Windows-blue>
+            <img src=https://img.shields.io/badge/-Linux-blue>
+            <img src=https://img.shields.io/badge/-MacOS-blue>
+            <img src=https://img.shields.io/badge/-PyQt4-green>
+            <img src=https://img.shields.io/badge/-PyQt5-green>
+            <img src=https://img.shields.io/badge/-PySide-green>
+            <img src=https://img.shields.io/badge/-PySide2-green>
+            <br>
+            <img src=https://img.shields.io/pypi/pyversions/allzpark?color=steelblue>
+            <img src=https://img.shields.io/pypi/v/bleeding-rez?color=steelblue&label=bleeding-rez>
+        </p>
         <div class="container">
             <p id="description">
-                Powerful <b>application launcher</b> with <i>reproducible software environments</i>, for visual effects, feature animation and AAA-games productions.
+                Powerful <b>application launcher</b> with <i>reproducible software environments</i>, for visual effects, feature animation and triple-A game productions.
             </p>
         </div>
         <br>
         <div class="hboxlayout justify-left">
-            <a href="guides/#install" class="button blue">Learn more</a>
-            <a href="guides/#install" class="button red">Download</a>
+            <a href="getting-started" class="button blue">Learn more</a>
+            <a href="quickstart" class="button red">Download</a>
             <a href="https://github.com/mottosso/allzpark/issues/1" class="button green">Blog</a>
         </div>
         <br>
@@ -39,21 +48,33 @@ template: landing.html
 -->
 
 <div class="hboxlayout row-reverse">
-    <div class="vboxlayout">
+    <div class="vboxlayout" markdown="1">
         <h2>Package Based</h2>
         <p>
-Libraries, applications, projects.. package everything!
+Works on your machine?
 <br>
 <br>
-Allzpark is a package-based launcher, which means that everything related to a project is encapsulated into individual, version controlled and dependency managed <a href=guides/#package-management>"packages"</a>.
+Allzpark is a package-based launcher, which means that everything related to a project is encapsulated into individual, version controlled and dependency managed "packages". Each coming together to form an environment identical across your development machine and anywhere your software is used.
 <br>
-<br>
-Establish complex relationships between software, applications and projects with <a href="https://github.com/mottosso/bleeding-rez">bleeding-rez</a>, the underlying framework powering <b>Allzpark</b>.
+</p>
 
+```python
+# A package definition
+name = "blender"
+version = "2.80"
+
+def commands():
+    global env
+    env["PATH"].append("{root}/bin")
+    env["PYTHONPATH"].prepend("{root}/python")
+```
+
+<p>
+Establish complex relationships between software, applications and projects with <a href=https://github.com/mottosso/bleeding-rez>bleeding-rez</a>, the underlying framework powering Allzpark.
 </p>
     </div>
     <div class="smallspace"></div>
-    <img class="poster" src=https://user-images.githubusercontent.com/2152766/60490868-4b62a580-9c9f-11e9-857a-204a5e58ac35.gif>
+    <img class="poster" style="border: none; box-shadow: none; padding: 0" src=https://user-images.githubusercontent.com/2152766/61705822-7d1ad980-ad3e-11e9-81b3-473e8ac4e7c6.gif>
 </div>
 
 <div class="space"></div>
@@ -69,22 +90,41 @@ Establish complex relationships between software, applications and projects with
 <div class="hboxlayout">
     <div class="vboxlayout">
         <h2>Dual Representation</h2>
-        <p>
 
+<p>
 Allzpark is but a shell.
 
 Anything done via the GUI is available via the command-line, using standard Rez commands.
+</p>
+
+<div class="tabs">
+  <button class="tab powershell " onclick="setTab(event, 'powershell')"><p>powershell</p><div class="tab-gap"></div></button>
+  <button class="tab bash " onclick="setTab(event, 'bash')"><p>bash</p><div class="tab-gap"></div></button>
+</div>
+
+<div class="tab-content powershell" markdown="1">
+
+```powershell
+PS> rez env alita maya -q
+> PS> echo "Hello Rez!"
+> # Hello Rez!
+```
+
+</div>
+
+<div class="tab-content bash" markdown="1">
 
 ```bash
 $ rez env alita maya -q
 > $ echo "Hello Rez!"
-Hello Rez!
+# Hello Rez!
 ```
 
-</p>
-    </div>
-    <div class="smallspace"></div>
-    <img class="poster" src=https://user-images.githubusercontent.com/2152766/60496077-fbd5a700-9ca9-11e9-8ff4-09c272326fae.gif>
+</div>
+
+</div>
+<div class="smallspace"></div>
+<img class="poster" src=https://user-images.githubusercontent.com/2152766/60496077-fbd5a700-9ca9-11e9-8ff4-09c272326fae.gif>
 </div>
 
 <div class="space"></div>
@@ -114,33 +154,11 @@ Preview the environment, prior to launching an application. Make changes interac
 
 <!-- 
 
-    Process Management
-
--->
-
-<div class="hboxlayout">
-    <div class="vboxlayout">
-        <h2>Process Management</h2>
-<p>
-
-Organise your many running processes in a compact way. Give each instance of Maya a unique name, group them, color them, bring-to-front and mass-kill instances to establish available memory in a hurry.
-
-</p>
-    </div>
-    <div class="smallspace"></div>
-    <img class="poster" src=https://user-images.githubusercontent.com/2152766/60493791-82d45080-9ca5-11e9-8f7b-0be30a53d823.gif>
-</div>
-
-<div class="space"></div>
-<div class="space"></div>
-
-<!-- 
-
     Customisation
 
 -->
 
-<div class="hboxlayout justify-left row-reverse">
+<div class="hboxlayout">
     <div class="vboxlayout">
         <h2>Customisation</h2>
         <p>
@@ -151,7 +169,7 @@ Organise your many running processes in a compact way. Give each instance of May
         </p>
     </div>
     <div class="smallspace"></div>
-    <img class="poster" src=https://user-images.githubusercontent.com/2152766/60493792-82d45080-9ca5-11e9-8533-ae04803c71e2.gif>
+    <img class="poster" style="border: none; box-shadow: none; padding: 0" src=https://user-images.githubusercontent.com/2152766/61289704-e1c7b880-a7c1-11e9-94ba-20ef7a2ca6bc.gif>
 </div>
 
 
@@ -170,8 +188,8 @@ Organise your many running processes in a compact way. Give each instance of May
         Let's get this show on the road
     </p>
     <div class="hboxlayout justify-center">
-        <a href="guides/#install" class="button blue">Learn more</a>
-        <a href="guides/#install" class="button red">Download</a>
+        <a href="getting-started" class="button blue">Learn more</a>
+        <a href="quickstart" class="button red">Download</a>
     </div>
 </div>
 

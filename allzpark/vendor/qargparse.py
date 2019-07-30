@@ -285,9 +285,16 @@ class Number(QArgument):
         else:
             widget = QtWidgets.QSpinBox()
 
+        if self._data.get("minimum"):
+            widget.setMinimum(self._data.get("minimum"))
+
+        if self._data.get("maximum"):
+            widget.setMaximum(self._data.get("maximum"))
+
         widget.editingFinished.connect(self.changed.emit)
+
         self._read = lambda: widget.value()
-        self._write = lambda value: widget.setValue(value)
+        self._write = lambda value: widget.setValue(float(value))
 
         if self["default"] is not None:
             self._write(self["default"])
@@ -334,6 +341,10 @@ class String(QArgument):
         if current != self._previous:
             self.changed.emit()
             self._previous = current
+
+        else:
+            # Clarify to the user that his command was acknowledged
+            self.sender().clearFocus()
 
 
 class Info(String):
